@@ -1,6 +1,6 @@
 # GUT MCP (Godot 4.7, GUT 9.7.1)
 
-The GUT editor plugin includes a standalone local MCP server. It does not require or integrate with `godot_mcp`; it manages GUT tests only. The Godot editor must be open and responsive.
+The GUT editor plugin includes a standalone local MCP server. It does not require or integrate with `godot_mcp`; it manages GUT tests and reads debugger diagnostics for tests and normal game sessions. The Godot editor must be open and responsive.
 
 ## Connect
 
@@ -26,7 +26,10 @@ All arguments are optional. Unknown arguments, wrong types, and unknown run IDs 
 | `gut_get_config` | None | Test directories and scripts, file filters, current selection filters, versions, server status, recent run IDs |
 | `gut_list_tests` | `script`, `inner_class`, `test_name`, `offset`, `limit` | Recognized tests with script path, inner class, and method name |
 | `gut_run_tests` | `script`, `inner_class`, `test_name`, `close_on_finish`, `ignore_pause` | Immediate `run_id` and `starting` state |
-| `gut_get_run_status` | `run_id` | State, current test, elapsed time, progress, debugger pause, window status, stop request |
+| `gut_get_run_status` | `run_id` | State, current test, elapsed time, progress, debugger pause, diagnosis ID and last break reason, window status, stop request |
+| `gut_get_debug_sessions` | None | Active and recent diagnostics with `debug_id`, Godot `session_id`, optional `run_id`, and state |
+| `gut_get_debug_info` | `debug_id` or `run_id` | Last break reason and stacktrace with file, line, function, and `stacktrace_current` |
+| `gut_get_debug_output` | `debug_id` or `run_id`, `category`, `offset`, `limit` | A page of debugger output, errors, and warnings with their source |
 | `gut_get_results` | `run_id`, `section`, `offset`, `limit` | Summary and one page of results or output; `incomplete` marks partial results |
 | `gut_continue` | `run_id` | Resumes a GUT pause before teardown |
 | `gut_stop` | `run_id` | Stops a GUT run or closes its results window |
@@ -35,7 +38,7 @@ All arguments are optional. Unknown arguments, wrong types, and unknown run IDs 
 
 MCP runs default to `close_on_finish=true` and `ignore_pause=true`; set either to `false` to override it for one run. GUT's saved panel configuration is not changed. Internal runs started from the GUT panel are registered too; external shell and CLI runs are outside this interface.
 
-Without `run_id`, run-specific tools use the current or most recent run. `section` can be `tests` (default), `warnings`, `errors`, or `output`. `offset` starts at 0; `limit` ranges from 1 to 100 (default 50). `next_offset` gives the next position or `null`. Output is returned in 4096-character chunks. A page is limited to about 60 KiB; large items are shortened and marked with `page_truncated`. Individual strings are limited to 4096 characters and nested lists to 100 items. Each run stores up to 262144 characters of GUT output, with truncation marked by `output_truncated`. This is GUT's GUI and test output; arbitrary direct `print()` calls are not collected as a separate console log.
+Without `run_id`, run-specific tools use the current or most recent run. `section` can be `tests` (default), `warnings`, `errors`, or `output`. `offset` starts at 0; `limit` ranges from 1 to 100 (default 50). `next_offset` gives the next position or `null`. Output is returned in 4096-character chunks. A page is limited to about 60 KiB; large items are shortened and marked with `page_truncated`. Individual strings are limited to 4096 characters and nested lists to 100 items. Each run stores up to 262144 characters of GUT output, with truncation marked by `output_truncated`. This is GUT's GUI and test output; direct `print()` and `printerr()` calls are available through `gut_get_debug_output`.
 
 ## Workflow: start → status → results → stop if needed
 
@@ -65,6 +68,23 @@ The last ten runs are stored separately under `user://gut_temp_directory/mcp/`. 
 
 A responsive editor can stop a blocked test process. A fully blocked editor cannot answer MCP requests.
 
+## Workflow: select session → read diagnosis → read messages
+
+```text
+gut_get_debug_sessions({})
+gut_get_debug_info({"debug_id":"debug-…"})
+gut_get_debug_output({"debug_id":"debug-…","limit":50})
+gut_get_debug_output({"run_id":"…","category":"error"})
+```
+
+`debug_id` and `run_id` are mutually exclusive. With neither selector, these tools select the newest active diagnosis, otherwise the latest stopped one. Unknown IDs return a tool error. A known run without a debugger diagnosis returns empty data. With no sessions, info returns `{}` and output returns an empty page. Session listing uses `items`; states are `running`, `paused`, and `stopped`.
+
+Each session start gets a new diagnosis ID, even when Godot reuses its session ID. The editor retains the last ten diagnoses; GUT diagnoses also persist with the last ten runs. Break reasons, the last stacktrace, and captured messages remain readable after stopping. `stacktrace_current` is true only when the stack belongs to the current debugger pause. Continuing or stopping makes it historical; a new pause invalidates it until a new stack arrives. Large stacks are marked by `stacktrace_truncated`.
+
+Output categories are `stdout` (including rich text), `stderr`, `error`, and `warning`. Each entry identifies `debugger_output` or `debugger_error_tree` as its `source`. Repeated reads of an error tree do not duplicate messages; repeated print calls and distinct error occurrences remain separate. The last 500 messages are retained per diagnosis. `messages_dropped` and `output_truncated` identify discarded messages; long messages have `truncated: true`. Output uses the existing page and string size limits.
+
+Diagnostics provide read access only. They do not continue a debugger, inspect variables, or force a stacktrace from a hung process. A fresh stacktrace requires an actual debugger pause. A responsive editor can return existing output from a blocked test; a blocked editor cannot answer MCP requests. The bridge uses private editor signals and error-tree metadata verified with Godot 4.7; future editor changes may require updating it. The [Godot debugger source](https://github.com/godotengine/godot/blob/master/editor/debugger/script_editor_debugger.cpp) defines those signals and metadata.
+
 ## Verification
 
 From the project directory, run with Godot 4.7 (use the full path to Godot if it is not on `PATH`):
@@ -74,6 +94,8 @@ godot --headless --path . --script tests/mcp/check_scripts.gd
 godot --headless --path . --script tests/mcp/test_protocol.gd
 godot --headless --path . --script tests/mcp/test_manager.gd
 godot --headless --path . --script tests/mcp/test_runtime.gd
+# In an isolated copy of this project, with godot_mcp disabled:
+godot --headless --editor --path . --script tests/mcp/test_debug_editor.gd
 ```
 
 Use a separate `XDG_DATA_HOME` for harness tests; the manager test clears its test history. The runtime harness runs filtered tests and has its own watchdog. The production server has no test run watchdog.
@@ -86,4 +108,6 @@ With the editor open and GUT MCP enabled, run this client to check real HTTP, de
 python3 tests/mcp/live_smoke.py --url http://127.0.0.1:9081/mcp
 ```
 
-The client checks initialization, all seven tools, filters, successful/failed/pending tests, pause and resume, automatic window close, result retrieval, waiting and blocking tests with explicit stops, and repeated closing of a results window. Also check a port conflict (open another editor on the same port), normal game sessions during tool requests, panel runs, and plugin disable in the editor. Disable or remove `godot_mcp` to verify independence. For a CLI regression check, run the fixture with `-gtest=res://tests/mcp/test_fixture.gd -gunit_test_name=success -gexit`.
+The client checks initialization, all ten tools, filters, successful/failed/pending tests, pause and resume, automatic window close, result retrieval, waiting and blocking tests with explicit stops, and repeated closing of a results window. Also check a port conflict (open another editor on the same port), normal game sessions during tool requests, panel runs, and plugin disable in the editor. Disable or remove `godot_mcp` to verify independence. For a CLI regression check, run the fixture with `-gtest=res://tests/mcp/test_fixture.gd -gunit_test_name=success -gexit`.
+
+The editor harness starts normal game scenes, tests errors without pause, print/printerr, a real breakpoint, an assertion with stacktrace, session reuse, a blocking GUT test, cleanup, and the HTTP live suite on port 19081. Run it in an isolated project with separate `XDG_CONFIG_HOME` and `XDG_DATA_HOME`; child game processes require a working display. The two `debug_*.tscn` scenes deliberately generate errors.

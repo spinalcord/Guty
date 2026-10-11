@@ -9,6 +9,7 @@ var plugin
 var panel
 var bridge
 var server
+var diagnostics = preload("debug_diagnostics.gd").new()
 var runs: Dictionary = {}
 var order: Array = []
 var current = ""
@@ -70,6 +71,9 @@ func shutdown():
 		if _owns_playing_scene():
 			plugin.get_editor_interface().stop_playing_scene()
 		_finish_closed(owned)
+	bridge.shutdown()
+	for session_id in diagnostics.active.keys():
+		session_stopped(session_id)
 	plugin.remove_debugger_plugin(bridge)
 	if FileAccess.file_exists(LAUNCH):
 		DirAccess.remove_absolute(LAUNCH)
@@ -79,6 +83,8 @@ func _owns_playing_scene():
 	return not owned.is_empty() and editor.is_playing_scene() and editor.get_playing_scene() == SCENE
 
 func _process(_delta):
+	if bridge != null and bridge.has_method("poll"):
+		bridge.poll()
 	if owned.is_empty():
 		return
 	var run = runs[owned]
@@ -184,6 +190,11 @@ func receive(snapshot, session_id):
 		return
 	var was_terminal = run.state in TERMINAL
 	run.session_id = session_id
+	var diagnostic = diagnostics.for_session(session_id)
+	if not diagnostic.is_empty():
+		diagnostic.run_id = id
+		run.debug_id = diagnostic.debug_id
+		run.diagnostic = diagnostic
 	for key in ["state", "current_test", "completed_tests", "total_tests", "summary", "tests", "warnings", "errors", "output", "output_truncated", "incomplete"]:
 		if snapshot.has(key):
 			run[key] = snapshot[key]
@@ -193,7 +204,32 @@ func receive(snapshot, session_id):
 	if run.state in TERMINAL:
 		panel.load_result_output()
 
-func debug_break(session_id, paused, can_debug):
+func debug_session_started(session_id):
+	var debug_id = diagnostics.start(session_id)
+	# Associate even failures before the runtime bridge sends its first snapshot.
+	if _owns_playing_scene() and runs[owned].session_id == -1:
+		runs[owned].session_id = session_id
+		runs[owned].debug_id = debug_id
+		runs[owned].diagnostic = diagnostics.records[debug_id]
+		runs[owned].diagnostic.run_id = owned
+		_save(runs[owned])
+
+func debug_stack(session_id, frames):
+	diagnostics.stack(session_id, frames)
+	_save_diagnostic(session_id)
+
+func debug_output(session_id, entry):
+	diagnostics.output(session_id, entry)
+	_save_diagnostic(session_id)
+
+func _save_diagnostic(session_id):
+	var diagnostic = diagnostics.for_session(session_id)
+	if not diagnostic.is_empty() and runs.has(diagnostic.run_id):
+		_save(runs[diagnostic.run_id])
+
+func debug_break(session_id, paused, can_debug, reason = ""):
+	diagnostics.breaked(session_id, paused, can_debug, reason)
+	_save_diagnostic(session_id)
 	if owned.is_empty() or runs[owned].session_id != session_id:
 		return
 	runs[owned].debugger_paused = paused
@@ -201,6 +237,10 @@ func debug_break(session_id, paused, can_debug):
 	_save(runs[owned])
 
 func session_stopped(session_id):
+	var diagnostic = diagnostics.for_session(session_id)
+	diagnostics.stop(session_id)
+	if not diagnostic.is_empty() and runs.has(diagnostic.run_id):
+		_save(runs[diagnostic.run_id])
 	if not owned.is_empty() and runs[owned].session_id == session_id:
 		_finish_closed(owned)
 
@@ -229,6 +269,11 @@ func _load_runs():
 								data[key] = snapshot[key]
 				data.window_open = false
 				data.debugger_paused = false
+				if data.has("diagnostic"):
+					data.diagnostic.state = "stopped"
+					data.diagnostic.paused = false
+					data.diagnostic.can_debug = false
+					data.diagnostic.stacktrace_current = false
 				if data.state not in TERMINAL:
 					data.state = "runtime_error"
 					data.incomplete = true
@@ -261,7 +306,14 @@ func tool_list():
 	run_args.merge({"close_on_finish": {"type": "boolean", "default": true}, "ignore_pause": {"type": "boolean", "default": true}})
 	var results_args = page.duplicate(true)
 	results_args.merge({"run_id": str_type, "section": {"type": "string", "enum": ["tests", "warnings", "errors", "output"]}})
+	var debug_args = {"debug_id": str_type, "run_id": str_type}
+	var output_args = debug_args.duplicate(true)
+	output_args.merge(page)
+	output_args.category = {"type": "string", "enum": ["stdout", "stderr", "error", "warning"]}
 	var definitions = [
+		["gut_get_debug_sessions", "List active and recent debugger diagnostics, including normal game sessions.", {}],
+		["gut_get_debug_info", "Read the last break reason and stacktrace; select debug_id or run_id.", debug_args],
+		["gut_get_debug_output", "Read debugger output, errors and warnings page by page.", output_args],
 		["gut_get_config", "Read GUT configuration, versions, and MCP connection status.", {}],
 		["gut_list_tests", "Discover and list tests page by page (substring filters).", list_args],
 		["gut_run_tests", "Start tests in the editor and return a run_id immediately. Runs have no timeout.", run_args],
@@ -337,7 +389,47 @@ func _page(items, args):
 		end += 1
 	return {"items": result, "total": items.size(), "next_offset": end if end < items.size() else null, "page_truncated": truncated}
 
+func _debug_summary(record):
+	var result = {}
+	for key in ["debug_id", "session_id", "run_id", "state", "started_at", "ended_at"]:
+		result[key] = record[key]
+	return result
+
 func _call(name, args):
+	if name.begins_with("gut_get_debug_"):
+		if bridge != null and bridge.has_method("poll"):
+			bridge.poll()
+		if name == "gut_get_debug_sessions":
+			var items = []
+			var debug_ids = diagnostics.order.duplicate()
+			for active_id in diagnostics.active.values():
+				if active_id not in debug_ids:
+					debug_ids.append(active_id)
+			for debug_id in debug_ids:
+				items.append(_debug_summary(diagnostics.records[debug_id]))
+			for run_id in order:
+				var record = runs[run_id].get("diagnostic", {})
+				if not record.is_empty() and record.debug_id not in debug_ids:
+					items.append(_debug_summary(record))
+			return {"items": items}
+		var record = diagnostics.select(args, runs)
+		if record.has("error"):
+			return record
+		if name == "gut_get_debug_info":
+			if record.is_empty():
+				return {}
+			var info = diagnostics.info(record)
+			var stack_page = _page(record.stacktrace, {"limit": 100})
+			info.stacktrace = stack_page.items
+			info.stacktrace_truncated = info.stacktrace_truncated or stack_page.page_truncated or stack_page.next_offset != null
+			return info
+		var messages = []
+		for entry in record.get("messages", []):
+			if not args.has("category") or entry.category == args.category:
+				messages.append(entry)
+		var page = _page(messages, args)
+		page.merge({"debug_id": record.get("debug_id"), "run_id": record.get("run_id"), "output_truncated": record.get("messages_dropped", 0) > 0, "messages_dropped": record.get("messages_dropped", 0)})
+		return page
 	if name == "gut_get_config":
 		var opts = _options()
 		return {"directories": opts.dirs, "tests": opts.tests, "prefix": opts.prefix, "suffix": opts.suffix, "include_subdirs": opts.include_subdirs, "filters": {"selected": opts.selected, "inner_class": opts.inner_class, "test_name": opts.unit_test_name}, "gut_version": "9.7.1", "godot_version": Engine.get_version_info().string, "mcp": {"enabled": server.listener.is_listening(), "url": "http://127.0.0.1:%s/mcp" % server.port, "error": server.error, "requests": server.requests, "active_connections": server.clients.size(), "last_request_at": server.last_request_at, "protocol_versions": server.VERSIONS}, "recent_run_ids": order.duplicate()}
@@ -373,6 +465,8 @@ func _call(name, args):
 			status[key] = run[key]
 		if run.state not in TERMINAL:
 			status.elapsed_seconds = float(Time.get_ticks_msec() - run.started_ticks) / 1000.0
+		status.debug_id = run.get("debug_id")
+		status.last_break_reason = run.get("diagnostic", {}).get("last_break_reason", "")
 		status.gut_paused = run.state == "gut_paused"
 		status.debugger_can_continue = run.get("debugger_can_continue", false)
 		if run.debugger_paused:
